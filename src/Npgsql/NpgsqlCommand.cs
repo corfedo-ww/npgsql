@@ -412,6 +412,12 @@ public class NpgsqlCommand : DbCommand, ICloneable, IComponent
             s.ResetPreparation();
     }
 
+    internal void ResetPreparation(NpgsqlBatchCommand batchCommand)
+    {
+        _connectorPreparedOn = null;
+        batchCommand.ResetPreparation();
+    }
+
     #endregion State management
 
     #region Parameters
@@ -1459,6 +1465,7 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
 
                     if (WrappingBatch is not null)
                     {
+                        var afterErrorBarrier = false;
                         for (var i = 0; i < InternalBatchCommands.Count; i++)
                         {
                             var batchCommand = InternalBatchCommands[i];
@@ -1468,9 +1475,21 @@ GROUP BY pg_proc.proargnames, pg_proc.proargtypes, pg_proc.proallargtypes, pg_pr
 
                             if (connector.Settings.MaxAutoPrepare > 0 && batchCommand.TryAutoPrepare(connector))
                             {
-                                batchCommand.ConnectorPreparedOn = connector;
-                                numPrepared++;
+                                // If an earlier batch command is preparing this statement and fails before getting its RowDescription,
+                                // an error barrier would still let this one execute without it. Execute it unprepared instead.
+                                if (afterErrorBarrier && !batchCommand.IsPreparing &&
+                                    batchCommand.PreparedStatement!.State == PreparedState.BeingPrepared)
+                                {
+                                    batchCommand.ResetPreparation();
+                                }
+                                else
+                                {
+                                    batchCommand.ConnectorPreparedOn = connector;
+                                    numPrepared++;
+                                }
                             }
+
+                            afterErrorBarrier |= batchCommand.AppendErrorBarrier ?? EnableErrorBarriers;
                         }
                     }
                     else

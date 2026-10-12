@@ -403,9 +403,12 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
 
                     Expect<ParseCompleteMessage>(await Connector.ReadMessage(async).ConfigureAwait(false), Connector);
 
-                    if (statement.IsPreparing)
+                    var isPreparing = statement.IsPreparing;
+                    if (isPreparing)
                     {
-                        preparedStatement!.State = PreparedState.Prepared;
+                        // The statement now exists on the server, but if Bind fails (or gets cancelled) we won't get its RowDescription.
+                        // Keep it invalidated until we do, so that it gets replaced rather than executed without one.
+                        preparedStatement!.State = PreparedState.Invalidated;
                         Connector.PreparedStatementManager.NumPrepared++;
                         statement.IsPreparing = false;
                     }
@@ -425,6 +428,9 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
 
                         _ => throw Connector.UnexpectedMessageReceived(msg.Code)
                     };
+
+                    if (isPreparing)
+                        preparedStatement!.State = PreparedState.Prepared;
                 }
 
                 if (RowDescription is not null)
@@ -526,9 +532,14 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
                     statement.PreparedStatement is { } preparedStatement)
                 {
                     preparedStatement.State = PreparedState.Invalidated;
-                    Command.ResetPreparation();
                 }
             }
+
+            // Make sure the next execution replaces an invalidated statement (0A000 above, or prepared without getting its RowDescription).
+            // Only detach this statement, as the following ones may still have to be consumed when using error barriers.
+            if (StatementIndex >= 0 && StatementIndex < _statements.Count &&
+                _statements[StatementIndex] is { PreparedStatement.State: PreparedState.Invalidated } invalidatedStatement)
+                Command.ResetPreparation(invalidatedStatement);
 
             // For the statement that errored, if it was being prepared we need to update our bookkeeping to put them back in unprepared
             // state.
@@ -693,9 +704,11 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
 
                     Expect<ParseCompleteMessage>(await Connector.ReadMessage(async).ConfigureAwait(false), Connector);
 
-                    if (statement.IsPreparing)
+                    var isPreparing = statement.IsPreparing;
+                    if (isPreparing)
                     {
-                        pStatement!.State = PreparedState.Prepared;
+                        // Invalidated until we get the RowDescription, see NextResult
+                        pStatement!.State = PreparedState.Invalidated;
                         Connector.PreparedStatementManager.NumPrepared++;
                         statement.IsPreparing = false;
                     }
@@ -719,6 +732,9 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
                     default:
                         throw Connector.UnexpectedMessageReceived(msg.Code);
                     }
+
+                    if (isPreparing)
+                        pStatement!.State = PreparedState.Prepared;
 
                     var forall = true;
                     for (var i = StatementIndex + 1; i < _statements.Count; i++)
@@ -759,6 +775,11 @@ public sealed class NpgsqlDataReader : DbDataReader, IDbColumnSchemaGenerator
                 // already be using the recycled instance.
                 Command.IsCacheable = false;
             }
+
+            // Make sure the next execution replaces a statement which got prepared without a RowDescription
+            if (StatementIndex >= 0 && StatementIndex < _statements.Count &&
+                _statements[StatementIndex] is { PreparedStatement.State: PreparedState.Invalidated } invalidatedStatement)
+                Command.ResetPreparation(invalidatedStatement);
 
             // An error means all subsequent statements were skipped by PostgreSQL.
             // If any of them were being prepared, we need to update our bookkeeping to put

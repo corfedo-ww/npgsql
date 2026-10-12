@@ -169,6 +169,13 @@ public class AutoPrepareTests : TestBase
         // cmd1's statement is no longer valid (has been closed), make sure it still works (will run unprepared)
         cmd2.ExecuteScalar();
 
+        // Other commands with the same SQL should use the explicit statement rather than prepare another one
+        using (var cmd4 = new NpgsqlCommand("SELECT 1", conn))
+        {
+            cmd4.ExecuteNonQuery(); cmd4.ExecuteNonQuery();
+        }
+        Assert.That(checkCmd.ExecuteScalar(), Is.EqualTo(1));
+
         // Trigger autoprepare on a different query to confirm we didn't leave replaced statement in a bad state
         using var cmd3 = new NpgsqlCommand("SELECT 2", conn);
         cmd3.ExecuteNonQuery(); cmd3.ExecuteNonQuery();
@@ -618,6 +625,144 @@ LANGUAGE 'plpgsql';
 
         // However, Npgsql should invalidate the prepared statement in this case, so the next execution should work
         Assert.DoesNotThrowAsync(() => command.ExecuteNonQueryAsync());
+
+        // Other commands with the same SQL should use the replacing statement rather than prepare another one
+        for (var i = 0; i < 2; i++)
+            await connection.ExecuteNonQueryAsync(command.CommandText);
+        Assert.That(connection.Connector!.PreparedStatementManager.NumPrepared, Is.EqualTo(1));
+    }
+
+    [Test]
+    public async Task Auto_prepared_statement_invalidation_in_batch_with_error_barriers()
+    {
+        await using var dataSource = CreateDataSource(csb =>
+        {
+            csb.MaxAutoPrepare = 10;
+            csb.AutoPrepareMinUsages = 1;
+        });
+        await using var connection = await dataSource.OpenConnectionAsync();
+        var table = await CreateTempTable(connection, "foo int");
+
+        await using var batch = new NpgsqlBatch(connection)
+        {
+            EnableErrorBarriers = true,
+            BatchCommands = { new($"SELECT * FROM {table}"), new("SELECT 2") }
+        };
+        await batch.ExecuteNonQueryAsync();
+
+        await connection.ExecuteNonQueryAsync($"ALTER TABLE {table} RENAME COLUMN foo TO bar");
+
+        // SELECT 2 is still prepared and gets consumed after the 0A000, so only the invalidated statement may be detached
+        var exception = Assert.ThrowsAsync<PostgresException>(() => batch.ExecuteNonQueryAsync())!;
+        Assert.That(exception.SqlState, Is.EqualTo(PostgresErrorCodes.FeatureNotSupported));
+        Assert.DoesNotThrowAsync(() => batch.ExecuteNonQueryAsync());
+    }
+
+    [Test, IssueLink("https://github.com/npgsql/npgsql/issues/6391")]
+    public async Task Auto_prepare_with_bind_failure([Values] bool replaceExisting)
+    {
+        await using var dataSource = CreateDataSource(csb =>
+        {
+            csb.MaxAutoPrepare = 1;
+            csb.AutoPrepareMinUsages = 1;
+        });
+        await using var connection = await dataSource.OpenConnectionAsync();
+
+        if (replaceExisting)
+            Assert.That(await connection.ExecuteScalarAsync("SELECT 1"), Is.EqualTo(1));
+
+        await using var command = new NpgsqlCommand("SELECT 1 / $1", connection) { Parameters = { new() { Value = 0 } } };
+
+        // Parse succeeds, but planning during Bind fails (constant folding of 1 / 0), so we never get the RowDescription
+        var exception = Assert.ThrowsAsync<PostgresException>(() => command.ExecuteScalarAsync())!;
+        Assert.That(exception.SqlState, Is.EqualTo(PostgresErrorCodes.DivisionByZero));
+
+        // The next executions must not reuse the statement without a RowDescription (unexpected DataRow)
+        command.Parameters[0].Value = 1;
+        Assert.That(await command.ExecuteScalarAsync(), Is.EqualTo(1));
+        Assert.That(await command.ExecuteScalarAsync(), Is.EqualTo(1));
+        Assert.That(connection.Connector!.PreparedStatementManager.NumPrepared, Is.EqualTo(1));
+
+        if (replaceExisting)
+            Assert.That(await connection.ExecuteScalarAsync("SELECT 1"), Is.EqualTo(1));
+    }
+
+    [Test, IssueLink("https://github.com/npgsql/npgsql/issues/6391")]
+    public async Task Auto_prepare_with_bind_failure_in_batch_with_error_barriers()
+    {
+        await using var dataSource = CreateDataSource(csb =>
+        {
+            csb.MaxAutoPrepare = 10;
+            csb.AutoPrepareMinUsages = 1;
+        });
+        await using var connection = await dataSource.OpenConnectionAsync();
+
+        // SELECT 2 is already prepared, so it's sent with just a Bind and its result is consumed after the error
+        Assert.That(await connection.ExecuteScalarAsync("SELECT 2"), Is.EqualTo(2));
+
+        await using var batch = new NpgsqlBatch(connection)
+        {
+            EnableErrorBarriers = true,
+            BatchCommands =
+            {
+                new("SELECT 1 / $1") { Parameters = { new() { Value = 0 } } },
+                new("SELECT 2")
+            }
+        };
+
+        var exception = Assert.ThrowsAsync<PostgresException>(() => batch.ExecuteNonQueryAsync())!;
+        Assert.That(exception.SqlState, Is.EqualTo(PostgresErrorCodes.DivisionByZero));
+
+        batch.BatchCommands[0].Parameters[0].Value = 1;
+        for (var i = 0; i < 2; i++)
+        {
+            await using var reader = await batch.ExecuteReaderAsync();
+            Assert.That(await reader.ReadAsync());
+            Assert.That(reader.GetInt32(0), Is.EqualTo(1));
+            Assert.That(await reader.NextResultAsync());
+            Assert.That(await reader.ReadAsync());
+            Assert.That(reader.GetInt32(0), Is.EqualTo(2));
+        }
+
+        Assert.That(connection.Connector!.PreparedStatementManager.NumPrepared, Is.EqualTo(2));
+    }
+
+    [Test, IssueLink("https://github.com/npgsql/npgsql/issues/6391")]
+    public async Task Auto_prepare_duplicate_in_batch_with_bind_failure_and_error_barriers()
+    {
+        await using var dataSource = CreateDataSource(csb =>
+        {
+            csb.MaxAutoPrepare = 10;
+            csb.AutoPrepareMinUsages = 1;
+        });
+        await using var connection = await dataSource.OpenConnectionAsync();
+
+        await using var batch = new NpgsqlBatch(connection)
+        {
+            EnableErrorBarriers = true,
+            BatchCommands =
+            {
+                new("SELECT 1 / $1") { Parameters = { new() { Value = 0 } } },
+                new("SELECT 1 / $1") { Parameters = { new() { Value = 1 } } }
+            }
+        };
+
+        // The first command fails before getting the RowDescription, but the error barrier lets the second one execute
+        var exception = Assert.ThrowsAsync<PostgresException>(() => batch.ExecuteNonQueryAsync())!;
+        Assert.That(exception.SqlState, Is.EqualTo(PostgresErrorCodes.DivisionByZero));
+
+        batch.BatchCommands[0].Parameters[0].Value = 1;
+        for (var i = 0; i < 3; i++)
+        {
+            await using var reader = await batch.ExecuteReaderAsync();
+            Assert.That(await reader.ReadAsync());
+            Assert.That(reader.GetInt32(0), Is.EqualTo(1));
+            Assert.That(await reader.NextResultAsync());
+            Assert.That(await reader.ReadAsync());
+            Assert.That(reader.GetInt32(0), Is.EqualTo(1));
+        }
+
+        Assert.That(connection.Connector!.PreparedStatementManager.NumPrepared, Is.EqualTo(1));
     }
 
     [Test, IssueLink("https://github.com/npgsql/npgsql/issues/6432")]

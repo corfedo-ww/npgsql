@@ -127,7 +127,9 @@ sealed class PreparedStatement
 
     internal void CompleteUnprepare()
     {
-        _manager.BySql.Remove(Sql);
+        // The SQL may already map to the statement replacing this one (same SQL, e.g. when replacing an invalidated statement)
+        if (_manager.BySql.TryGetValue(Sql, out var statement) && statement == this)
+            _manager.BySql.Remove(Sql);
         _manager.NumPrepared--;
 
         State = PreparedState.Unprepared;
